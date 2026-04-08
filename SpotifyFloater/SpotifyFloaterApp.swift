@@ -74,6 +74,7 @@ struct SpotifyFloaterApp: App {
 class SpotifyAuthManager: NSObject, ObservableObject {
     private let clientID = Secrets.spotifyClientID
     private let redirectURI = Secrets.spotifyRedirectURI
+    private let authStateKey = "spotify_auth_state"
 
     @Published var isAuthenticated = false
     @Published var accessToken: String?
@@ -98,18 +99,13 @@ class SpotifyAuthManager: NSObject, ObservableObject {
     // MARK: - Initialization and Token Loading
 
     private func loadAndRefreshToken() {
-        // Migrate refresh token from UserDefaults to Keychain if present
-        if let old = UserDefaults.standard.string(forKey: "spotify_refresh_token") {
-            _ = KeychainService.set(old, for: "spotify_refresh_token")
-            UserDefaults.standard.removeObject(forKey: "spotify_refresh_token")
-            print("Migrated refresh token from UserDefaults to Keychain.")
+        var state = loadAuthState()
+        if state == nil {
+            state = migrateLegacyTokensIfNeeded()
         }
-
-        // Load anything we have from Keychain
-        self.refreshToken = KeychainService.get("spotify_refresh_token")
-        let storedAccess = KeychainService.get("spotify_access_token")
-        let storedExpiryString = KeychainService.get("spotify_expires_at")
-        let storedExpiry = storedExpiryString.flatMap(Double.init).map(Date.init(timeIntervalSince1970:))
+        self.refreshToken = state?.refreshToken
+        let storedAccess = state?.accessToken
+        let storedExpiry = state?.expiresAt.map(Date.init(timeIntervalSince1970:))
 
         // If we have a still-valid access token, use it immediately (no login prompt)
         if let token = storedAccess, let exp = storedExpiry, Date().addingTimeInterval(120) < exp {
@@ -127,6 +123,66 @@ class SpotifyAuthManager: NSObject, ObservableObject {
         } else {
             print("No refresh token found in Keychain.")
         }
+    }
+
+    private struct AuthState: Codable {
+        let accessToken: String?
+        let refreshToken: String?
+        let expiresAt: Double?
+    }
+
+    private func loadAuthState() -> AuthState? {
+        guard let json = KeychainService.get(authStateKey) else { return nil }
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(AuthState.self, from: data)
+    }
+
+    private func saveAuthState(accessToken: String?, refreshToken: String?, expiresAt: Date?) {
+        let state = AuthState(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            expiresAt: expiresAt.map { $0.timeIntervalSince1970 }
+        )
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        guard let json = String(data: data, encoding: .utf8) else { return }
+        _ = KeychainService.set(json, for: authStateKey)
+    }
+
+    private func clearAuthState() {
+        _ = KeychainService.delete(authStateKey)
+        // Also clear legacy keys just in case user is upgrading/downgrading between builds.
+        _ = KeychainService.delete("spotify_refresh_token")
+        _ = KeychainService.delete("spotify_access_token")
+        _ = KeychainService.delete("spotify_expires_at")
+        UserDefaults.standard.removeObject(forKey: "spotify_refresh_token")
+    }
+
+    private func migrateLegacyTokensIfNeeded() -> AuthState? {
+        // Legacy storage: 3 separate Keychain items + (very old) UserDefaults refresh token.
+        let legacyAccess = KeychainService.get("spotify_access_token")
+        let legacyRefreshFromKeychain = KeychainService.get("spotify_refresh_token")
+        let legacyRefreshFromDefaults = UserDefaults.standard.string(forKey: "spotify_refresh_token")
+        let legacyRefresh = legacyRefreshFromKeychain ?? legacyRefreshFromDefaults
+        let legacyExpiry = KeychainService.get("spotify_expires_at").flatMap(Double.init)
+
+        if legacyAccess == nil && legacyRefresh == nil && legacyExpiry == nil {
+            return nil
+        }
+
+        let expiryDate = legacyExpiry.map(Date.init(timeIntervalSince1970:))
+        saveAuthState(accessToken: legacyAccess, refreshToken: legacyRefresh, expiresAt: expiryDate)
+        let migratedState = AuthState(accessToken: legacyAccess, refreshToken: legacyRefresh, expiresAt: legacyExpiry)
+
+        // Remove legacy items to reduce repeated Keychain prompts.
+        _ = KeychainService.delete("spotify_refresh_token")
+        _ = KeychainService.delete("spotify_access_token")
+        _ = KeychainService.delete("spotify_expires_at")
+        if legacyRefreshFromDefaults != nil {
+            UserDefaults.standard.removeObject(forKey: "spotify_refresh_token")
+        }
+
+        print("Migrated legacy Spotify tokens to a single Keychain item.")
+        return migratedState
     }
 
     // MARK: - Authentication Flow
@@ -217,15 +273,8 @@ class SpotifyAuthManager: NSObject, ObservableObject {
                     self?.expiresAt = expiry
                     self?.isAuthenticated = true
 
-                    // Persist tokens to Keychain
-                    _ = KeychainService.set(tokenResponse.access_token, for: "spotify_access_token")
-                    _ = KeychainService.set(String(expiry.timeIntervalSince1970), for: "spotify_expires_at")
-                    if let refreshToken = tokenResponse.refresh_token {
-                        _ = KeychainService.set(refreshToken, for: "spotify_refresh_token")
-                        print("Saved refresh and access tokens to Keychain.")
-                    } else {
-                        print("No refresh token received to save.")
-                    }
+                    // Persist tokens to Keychain as a single item (reduces repeated prompts).
+                    self?.saveAuthState(accessToken: tokenResponse.access_token, refreshToken: tokenResponse.refresh_token, expiresAt: expiry)
                 }
             } catch {
                 print("Failed to decode token response: \(error)")
@@ -238,9 +287,7 @@ class SpotifyAuthManager: NSObject, ObservableObject {
         refreshToken = nil
         expiresAt = nil
         isAuthenticated = false
-        _ = KeychainService.delete("spotify_refresh_token")
-        _ = KeychainService.delete("spotify_access_token")
-        _ = KeychainService.delete("spotify_expires_at")
+        clearAuthState()
     }
 
     // Wrapper to maintain existing call sites
@@ -250,7 +297,7 @@ class SpotifyAuthManager: NSObject, ObservableObject {
 
     // Completion-based refresh to enable 401 refresh-and-retry flows
     func refreshAccessToken(completion: @escaping (Bool) -> Void) {
-        guard let token = self.refreshToken ?? KeychainService.get("spotify_refresh_token") else {
+        guard let token = self.refreshToken else {
             print("refreshAccessToken: No refresh token available.")
             completion(false)
             return
@@ -300,10 +347,10 @@ class SpotifyAuthManager: NSObject, ObservableObject {
 
                 // Only delete refresh token if Spotify says it's invalid (revoked/expired)
                 if http.statusCode == 400 && code == "invalid_grant" {
-                    _ = KeychainService.delete("spotify_refresh_token")
                     self?.refreshToken = nil
                     DispatchQueue.main.async {
                         self?.isAuthenticated = false
+                        self?.clearAuthState()
                         print("refreshAccessToken: Refresh token invalid; cleared from Keychain.")
                         completion(false)
                     }
@@ -324,16 +371,16 @@ class SpotifyAuthManager: NSObject, ObservableObject {
                     self?.accessToken = tokenResponse.access_token
                     if let newRefreshToken = tokenResponse.refresh_token {
                         self?.refreshToken = newRefreshToken
-                        _ = KeychainService.set(newRefreshToken, for: "spotify_refresh_token")
                         print("refreshAccessToken: Updated and saved new refresh token.")
                     } else {
                         print("refreshAccessToken: No new refresh token received.")
                     }
                     let expiry = Date().addingTimeInterval(TimeInterval(tokenResponse.expires_in))
                     self?.expiresAt = expiry
-                    _ = KeychainService.set(tokenResponse.access_token, for: "spotify_access_token")
-                    _ = KeychainService.set(String(expiry.timeIntervalSince1970), for: "spotify_expires_at")
                     self?.isAuthenticated = true
+                    if let self = self {
+                        self.saveAuthState(accessToken: self.accessToken, refreshToken: self.refreshToken, expiresAt: self.expiresAt)
+                    }
                     print("refreshAccessToken: Successfully refreshed token. isAuthenticated is now true.")
                     completion(true)
                 }
@@ -579,7 +626,7 @@ class SpotifyAuthManager: NSObject, ObservableObject {
             // If no known expiry, try to refresh if we have a refresh token
             if self.accessToken != nil {
                 completion(true)
-            } else if self.refreshToken != nil || KeychainService.get("spotify_refresh_token") != nil {
+            } else if self.refreshToken != nil {
                 self.refreshAccessToken(completion: completion)
             } else {
                 completion(false)
