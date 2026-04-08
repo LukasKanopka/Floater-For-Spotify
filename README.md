@@ -100,7 +100,7 @@ Design choices audited
 
 Where to change values
 - Client ID / Redirect URI:
-  - `SpotifyFloater/Secrets.swift` (generated locally from `SpotifyFloater/Secrets.template.swift`)
+  - `SpotifyFloater/Secrets.swift` (generated locally from `SpotifyFloater/Secrets.swift.template`)
   - Redirect URI must stay aligned with [SpotifyFloater/Info.plist](SpotifyFloater/Info.plist) and the Spotify Dashboard
 
 Homebrew distribution

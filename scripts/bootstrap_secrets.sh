@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-template="$repo_root/SpotifyFloater/Secrets.template.swift"
+template="$repo_root/SpotifyFloater/Secrets.swift.template"
 dest="$repo_root/SpotifyFloater/Secrets.swift"
 
 if [[ ! -f "$template" ]]; then
