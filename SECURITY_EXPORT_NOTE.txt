@@ -1,0 +1,1 @@
+Note: SpotifyFloater/Secrets.swift is intentionally not included.

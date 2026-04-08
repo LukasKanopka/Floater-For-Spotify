@@ -1,0 +1,12 @@
+# Xcode
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# Local secrets/config (do not commit)
+/SpotifyFloater/Secrets.swift
+
